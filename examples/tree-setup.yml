@@ -1,0 +1,21 @@
+setup:
+  source: "../main-checkout"
+  destination: "../new-worktree"
+
+  directories:
+    - "specs/feature-spec"
+    - ".mcp-configs"
+    - ".agents":
+        - "skills"
+    - ".claude":
+        - "skills"
+    - ".codex"
+  files:
+    - "AGENTS.md"
+    - "CLAUDE.md"
+    - ".gitignore"
+    - ".python-version"
+
+  mappings:
+    - ".claude/skills": "../shared-skills/claude"
+    - ".agents/skills": "../shared-skills/codex"

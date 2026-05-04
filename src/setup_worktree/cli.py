@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import click
+import yaml
+
+
+@dataclass(frozen=True)
+class CopyPlan:
+    """Normalized copy instructions loaded from a YAML configuration file."""
+
+    source_root: Path
+    destination_root: Path
+    directories: tuple[Path, ...]
+    files: tuple[Path, ...]
+    mappings: tuple[tuple[Path, Path], ...]
+
+
+def _as_path(value: Any, field_name: str) -> Path:
+    """Validate a YAML scalar as a path and expand a leading user home marker."""
+    if not isinstance(value, str) or not value.strip():
+        raise click.ClickException(f"`{field_name}` must be a non-empty string.")
+    return Path(value).expanduser()
+
+
+def _config_path(value: Any, field_name: str, config_dir: Path) -> Path:
+    """Validate a YAML scalar as a path relative to the config file directory."""
+    path = _as_path(value, field_name)
+    if path.is_absolute():
+        return path
+    return (config_dir / path).resolve()
+
+
+def _relative_path(value: Any, field_name: str) -> Path:
+    """Validate a YAML scalar as a relative path."""
+    path = _as_path(value, field_name)
+    if path.is_absolute():
+        raise click.ClickException(f"`{field_name}` must be relative: {value}")
+    return path
+
+
+def _flatten_directories(items: Any) -> tuple[Path, ...]:
+    """Normalize directory entries into a deduplicated tuple of relative paths."""
+    if items is None:
+        return ()
+    if not isinstance(items, list):
+        raise click.ClickException("`setup.directories` must be a list.")
+
+    directories: list[Path] = []
+    for item in items:
+        if isinstance(item, str):
+            directories.append(_relative_path(item, "setup.directories[]"))
+            continue
+
+        if not isinstance(item, dict):
+            raise click.ClickException(
+                "`setup.directories` entries must be strings or mappings."
+            )
+
+        for parent, children in item.items():
+            parent_path = _relative_path(parent, "setup.directories[]")
+            directories.append(parent_path)
+            if children is None:
+                continue
+            if not isinstance(children, list):
+                raise click.ClickException(
+                    f"`setup.directories.{parent}` must be a list."
+                )
+            for child in children:
+                directories.append(
+                    parent_path / _relative_path(child, f"setup.directories.{parent}[]")
+                )
+
+    return tuple(dict.fromkeys(directories))
+
+
+def _flatten_files(items: Any) -> tuple[Path, ...]:
+    """Normalize file entries into a tuple of relative paths."""
+    if items is None:
+        return ()
+    if not isinstance(items, list):
+        raise click.ClickException("`setup.files` must be a list.")
+    return tuple(_relative_path(item, "setup.files[]") for item in items)
+
+
+def _flatten_mappings(
+    items: Any,
+    config_dir: Path,
+) -> tuple[tuple[Path, Path], ...]:
+    """Normalize explicit destination-to-source mapping entries."""
+    if items is None:
+        return ()
+
+    raw_mappings: list[tuple[Any, Any]]
+    if isinstance(items, dict):
+        raw_mappings = list(items.items())
+    elif isinstance(items, list):
+        raw_mappings = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise click.ClickException("`setup.mappings` entries must be mappings.")
+            raw_mappings.extend(item.items())
+    else:
+        raise click.ClickException("`setup.mappings` must be a mapping or list.")
+
+    mappings: list[tuple[Path, Path]] = []
+    for destination, source in raw_mappings:
+        mappings.append(
+            (
+                _relative_path(destination, "setup.mappings destination"),
+                _config_path(source, "setup.mappings source", config_dir),
+            )
+        )
+    return tuple(mappings)
+
+
+def load_plan(config_path: Path) -> CopyPlan:
+    """Load and validate a YAML configuration file as a copy plan."""
+    config_path = config_path.expanduser().resolve()
+    config_dir = config_path.parent
+
+    try:
+        with config_path.open("r", encoding="utf-8") as stream:
+            data = yaml.safe_load(stream) or {}
+    except FileNotFoundError as exc:
+        raise click.ClickException(f"Configuration file not found: {config_path}") from exc
+    except yaml.YAMLError as exc:
+        raise click.ClickException(f"Invalid YAML in {config_path}: {exc}") from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("setup"), dict):
+        raise click.ClickException("Configuration must contain a `setup` mapping.")
+
+    setup = data["setup"]
+    return CopyPlan(
+        source_root=_config_path(setup.get("source"), "setup.source", config_dir),
+        destination_root=_config_path(
+            setup.get("destination"),
+            "setup.destination",
+            config_dir,
+        ),
+        directories=_flatten_directories(setup.get("directories")),
+        files=_flatten_files(setup.get("files")),
+        mappings=_flatten_mappings(setup.get("mappings"), config_dir),
+    )
+
+
+def _copy_directory(
+    source: Path,
+    destination: Path,
+    *,
+    dry_run: bool,
+    strict: bool,
+) -> None:
+    """Copy a directory tree, optionally skipping or failing on missing sources."""
+    if not source.is_dir():
+        message = f"Directory not found: {source}"
+        if strict:
+            raise click.ClickException(message)
+        click.echo(f"Skipping {message}")
+        return
+
+    click.echo(f"Copy directory {source} -> {destination}")
+    if dry_run:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+def _copy_file(
+    source: Path,
+    destination: Path,
+    *,
+    dry_run: bool,
+    strict: bool,
+) -> None:
+    """Copy a single file, optionally skipping or failing on missing sources."""
+    if not source.is_file():
+        message = f"File not found: {source}"
+        if strict:
+            raise click.ClickException(message)
+        click.echo(f"Skipping {message}")
+        return
+
+    click.echo(f"Copy file {source} -> {destination}")
+    if dry_run:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def _copy_path(
+    source: Path,
+    destination: Path,
+    *,
+    dry_run: bool,
+    strict: bool,
+) -> None:
+    """Copy a source path as either a directory or file based on its type."""
+    if source.is_dir():
+        _copy_directory(source, destination, dry_run=dry_run, strict=strict)
+    else:
+        _copy_file(source, destination, dry_run=dry_run, strict=strict)
+
+
+def execute_plan(plan: CopyPlan, *, dry_run: bool = False, strict: bool = False) -> None:
+    """Copy all configured paths from a loaded plan into the destination root."""
+    destination_root = plan.destination_root
+    if dry_run:
+        click.echo("Dry run: no files will be changed.")
+    else:
+        destination_root.mkdir(parents=True, exist_ok=True)
+
+    mapping_sources = dict(plan.mappings)
+    copied_mappings: set[Path] = set()
+
+    for directory in plan.directories:
+        source = mapping_sources.get(directory)
+        if source is None:
+            _copy_directory(
+                plan.source_root / directory,
+                destination_root / directory,
+                dry_run=dry_run,
+                strict=strict,
+            )
+        else:
+            copied_mappings.add(directory)
+            _copy_path(
+                source,
+                destination_root / directory,
+                dry_run=dry_run,
+                strict=strict,
+            )
+
+    for file_path in plan.files:
+        source = mapping_sources.get(file_path)
+        if source is None:
+            _copy_file(
+                plan.source_root / file_path,
+                destination_root / file_path,
+                dry_run=dry_run,
+                strict=strict,
+            )
+        else:
+            copied_mappings.add(file_path)
+            _copy_path(
+                source,
+                destination_root / file_path,
+                dry_run=dry_run,
+                strict=strict,
+            )
+
+    for destination, source in plan.mappings:
+        if destination in copied_mappings:
+            continue
+        _copy_path(
+            source,
+            destination_root / destination,
+            dry_run=dry_run,
+            strict=strict,
+        )
+
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument(
+    "config_path",
+    type=click.Path(path_type=Path, dir_okay=False, exists=False),
+    required=False,
+)
+@click.option(
+    "-c",
+    "--config",
+    "config_option",
+    type=click.Path(path_type=Path, dir_okay=False, exists=False),
+    help="Path to the YAML configuration file.",
+)
+@click.option(
+    "--path",
+    "path_option",
+    type=click.Path(path_type=Path, dir_okay=False, exists=False),
+    help="Alias for --config.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print planned copies without changing the destination.",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Fail when a configured source path is missing instead of skipping it.",
+)
+def run(
+    config_path: Path | None,
+    config_option: Path | None,
+    path_option: Path | None,
+    dry_run: bool,
+    strict: bool,
+) -> None:
+    """Copy configured files and directories into a worktree."""
+    configured_paths = [
+        path for path in (config_path, config_option, path_option) if path is not None
+    ]
+    if len(configured_paths) > 1:
+        raise click.ClickException("Provide only one config path.")
+
+    config = configured_paths[0] if configured_paths else Path("tree-setup.yml")
+    plan = load_plan(config)
+    execute_plan(plan, dry_run=dry_run, strict=strict)
+
+
+if __name__ == "__main__":
+    run()
