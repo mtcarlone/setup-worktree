@@ -8,6 +8,13 @@ from typing import Any
 import click
 import yaml
 
+AGENT_ORDER = ("codex", "claude")
+AGENT_CHOICES = (*AGENT_ORDER, "all")
+COMMON_TEMPLATE_FILES = (".gitignore", ".python-version")
+
+
+DirectoryTemplate = str | tuple[str, tuple[str, ...]]
+
 
 @dataclass(frozen=True)
 class CopyPlan:
@@ -18,6 +25,37 @@ class CopyPlan:
     directories: tuple[Path, ...]
     files: tuple[Path, ...]
     mappings: tuple[tuple[Path, Path], ...]
+
+
+@dataclass(frozen=True)
+class CopyOperation:
+    """A resolved source and destination pair to copy."""
+
+    source: Path
+    destination: Path
+
+
+@dataclass(frozen=True)
+class AgentTemplate:
+    """Starter YAML entries for one supported agent."""
+
+    directories: tuple[DirectoryTemplate, ...]
+    files: tuple[str, ...]
+    mappings: tuple[tuple[str, str], ...]
+
+
+AGENT_TEMPLATES = {
+    "codex": AgentTemplate(
+        directories=((".agents", ("skills",)), ".codex"),
+        files=("AGENTS.md",),
+        mappings=((".agents/skills", "../shared-skills/codex"),),
+    ),
+    "claude": AgentTemplate(
+        directories=((".claude", ("skills",)),),
+        files=("CLAUDE.md",),
+        mappings=((".claude/skills", "../shared-skills/claude"),),
+    ),
+}
 
 
 def _as_path(value: Any, field_name: str) -> Path:
@@ -206,6 +244,31 @@ def _copy_path(
         _copy_file(source, destination, dry_run=dry_run, strict=strict)
 
 
+def _copy_operations(plan: CopyPlan) -> tuple[CopyOperation, ...]:
+    """Resolve plan entries into ordered copy operations."""
+    operations: list[CopyOperation] = []
+    mapping_sources = dict(plan.mappings)
+    copied_mappings: set[Path] = set()
+
+    for directory in plan.directories:
+        source = mapping_sources.get(directory, plan.source_root / directory)
+        if directory in mapping_sources:
+            copied_mappings.add(directory)
+        operations.append(CopyOperation(source, plan.destination_root / directory))
+
+    for file_path in plan.files:
+        source = mapping_sources.get(file_path, plan.source_root / file_path)
+        if file_path in mapping_sources:
+            copied_mappings.add(file_path)
+        operations.append(CopyOperation(source, plan.destination_root / file_path))
+
+    for destination, source in plan.mappings:
+        if destination not in copied_mappings:
+            operations.append(CopyOperation(source, plan.destination_root / destination))
+
+    return tuple(operations)
+
+
 def execute_plan(plan: CopyPlan, *, dry_run: bool = False, strict: bool = False) -> None:
     """Copy all configured paths from a loaded plan into the destination root."""
     destination_root = plan.destination_root
@@ -214,57 +277,126 @@ def execute_plan(plan: CopyPlan, *, dry_run: bool = False, strict: bool = False)
     else:
         destination_root.mkdir(parents=True, exist_ok=True)
 
-    mapping_sources = dict(plan.mappings)
-    copied_mappings: set[Path] = set()
-
-    for directory in plan.directories:
-        source = mapping_sources.get(directory)
-        if source is None:
-            _copy_directory(
-                plan.source_root / directory,
-                destination_root / directory,
-                dry_run=dry_run,
-                strict=strict,
-            )
-        else:
-            copied_mappings.add(directory)
-            _copy_path(
-                source,
-                destination_root / directory,
-                dry_run=dry_run,
-                strict=strict,
-            )
-
-    for file_path in plan.files:
-        source = mapping_sources.get(file_path)
-        if source is None:
-            _copy_file(
-                plan.source_root / file_path,
-                destination_root / file_path,
-                dry_run=dry_run,
-                strict=strict,
-            )
-        else:
-            copied_mappings.add(file_path)
-            _copy_path(
-                source,
-                destination_root / file_path,
-                dry_run=dry_run,
-                strict=strict,
-            )
-
-    for destination, source in plan.mappings:
-        if destination in copied_mappings:
-            continue
+    for operation in _copy_operations(plan):
         _copy_path(
-            source,
-            destination_root / destination,
+            operation.source,
+            operation.destination,
             dry_run=dry_run,
             strict=strict,
         )
 
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+class SetupWorktreeGroup(click.Group):
+    """Route unknown top-level arguments to the copy command for compatibility."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        """Treat `setup-worktree config.yml` as `setup-worktree copy config.yml`."""
+        if args:
+            first_arg = args[0]
+            if first_arg not in self.commands and first_arg not in ("-h", "--help"):
+                args = ["copy", *args]
+        return super().parse_args(ctx, args)
+
+
+def _resolve_config_path(
+    config_path: Path | None,
+    config_option: Path | None,
+    path_option: Path | None,
+) -> Path:
+    """Resolve positional and option-style config inputs into one path."""
+    configured_paths = [
+        path for path in (config_path, config_option, path_option) if path is not None
+    ]
+    if len(configured_paths) > 1:
+        raise click.ClickException("Provide only one config path.")
+
+    return configured_paths[0] if configured_paths else Path("tree-setup.yml")
+
+
+def _selected_agents(agents: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize requested template agents into a stable, deduplicated tuple."""
+    if not agents or "all" in agents:
+        return AGENT_ORDER
+
+    selected = tuple(agent for agent in AGENT_ORDER if agent in agents)
+    if not selected:
+        raise click.ClickException("Select at least one supported agent.")
+    return selected
+
+
+def _template_spec(agents: tuple[str, ...]) -> AgentTemplate:
+    """Merge selected agent templates into one renderable template."""
+    directories: list[DirectoryTemplate] = []
+    files: list[str] = []
+    mappings: list[tuple[str, str]] = []
+
+    for agent in agents:
+        template = AGENT_TEMPLATES[agent]
+        directories.extend(template.directories)
+        files.extend(template.files)
+        mappings.extend(template.mappings)
+
+    files.extend(COMMON_TEMPLATE_FILES)
+    return AgentTemplate(
+        directories=tuple(dict.fromkeys(directories)),
+        files=tuple(dict.fromkeys(files)),
+        mappings=tuple(dict.fromkeys(mappings)),
+    )
+
+
+def _render_template(agents: tuple[str, ...]) -> str:
+    """Render a starter YAML configuration for the selected agents."""
+    template = _template_spec(agents)
+    lines = [
+        "setup:",
+        '  source: "../main-checkout"',
+        '  destination: "../new-worktree"',
+        "",
+        "  directories:",
+    ]
+
+    for directory in template.directories:
+        if isinstance(directory, str):
+            lines.append(f'    - "{directory}"')
+            continue
+
+        parent, children = directory
+        lines.append(f'    - "{parent}":')
+        for child in children:
+            lines.append(f'        - "{child}"')
+
+    lines.extend(["", "  files:"])
+    for file_path in template.files:
+        lines.append(f'    - "{file_path}"')
+
+    lines.extend(["", "  mappings:"])
+    for destination, source in template.mappings:
+        lines.append(f'    - "{destination}": "{source}"')
+
+    return "\n".join(lines) + "\n"
+
+
+def write_template(output: Path, agents: tuple[str, ...], *, force: bool) -> None:
+    """Write a starter YAML configuration file for the selected agents."""
+    output = output.expanduser()
+    if output.exists() and not force:
+        raise click.ClickException(f"Template already exists: {output}")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(_render_template(agents), encoding="utf-8")
+    click.echo(f"Wrote template {output}")
+
+
+@click.group(
+    cls=SetupWorktreeGroup,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    no_args_is_help=True,
+)
+def run() -> None:
+    """Copy worktree setup files and create starter configuration templates."""
+
+
+@run.command()
 @click.argument(
     "config_path",
     type=click.Path(path_type=Path, dir_okay=False, exists=False),
@@ -293,7 +425,7 @@ def execute_plan(plan: CopyPlan, *, dry_run: bool = False, strict: bool = False)
     is_flag=True,
     help="Fail when a configured source path is missing instead of skipping it.",
 )
-def run(
+def copy(
     config_path: Path | None,
     config_option: Path | None,
     path_option: Path | None,
@@ -301,15 +433,34 @@ def run(
     strict: bool,
 ) -> None:
     """Copy configured files and directories into a worktree."""
-    configured_paths = [
-        path for path in (config_path, config_option, path_option) if path is not None
-    ]
-    if len(configured_paths) > 1:
-        raise click.ClickException("Provide only one config path.")
-
-    config = configured_paths[0] if configured_paths else Path("tree-setup.yml")
-    plan = load_plan(config)
+    plan = load_plan(_resolve_config_path(config_path, config_option, path_option))
     execute_plan(plan, dry_run=dry_run, strict=strict)
+
+
+@run.command()
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    type=click.Choice(AGENT_CHOICES, case_sensitive=False),
+    help="Agent config to include. Repeat for multiple agents.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=Path("tree-setup.yml"),
+    show_default=True,
+    help="Path to write the starter YAML file.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite the output file if it already exists.",
+)
+def init(agents: tuple[str, ...], output: Path, force: bool) -> None:
+    """Create a starter YAML configuration file."""
+    write_template(output, _selected_agents(agents), force=force)
 
 
 if __name__ == "__main__":
