@@ -125,5 +125,49 @@ setup:
             self.assertIn("Error: File not found:", strict_result.output)
 
 
+class InitTests(unittest.TestCase):
+    def test_init_defaults_to_all_agents(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "tree-setup.yml"
+
+            result = CliRunner().invoke(run, ["init", "--output", str(output)])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            template = output.read_text(encoding="utf-8")
+            self.assertIn('    - ".agents":', template)
+            self.assertIn('    - ".claude":', template)
+            self.assertIn('    - ".codex"', template)
+            self.assertIn('    - "AGENTS.md"', template)
+            self.assertIn('    - "CLAUDE.md"', template)
+
+    def test_init_scopes_single_agent_template(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "tree-setup.yml"
+
+            result = CliRunner().invoke(
+                run,
+                ["init", "--agent", "codex", "--output", str(output)],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            template = output.read_text(encoding="utf-8")
+            self.assertIn('    - ".agents":', template)
+            self.assertIn('    - ".codex"', template)
+            self.assertIn('    - "AGENTS.md"', template)
+            self.assertIn('    - ".agents/skills": "../shared-skills/codex"', template)
+            self.assertNotIn("CLAUDE.md", template)
+            self.assertNotIn(".claude", template)
+
+    def test_init_refuses_to_overwrite_without_force(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "tree-setup.yml"
+            output.write_text("existing", encoding="utf-8")
+
+            result = CliRunner().invoke(run, ["init", "--output", str(output)])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "existing")
+
+
 if __name__ == "__main__":
     unittest.main()
